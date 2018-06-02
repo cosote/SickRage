@@ -41,8 +41,8 @@ class KatProvider(TorrentProvider):  # pylint: disable=too-many-instance-attribu
         self.minseed = None
         self.minleech = None
 
-        self.url = "https://kat.cr"
-        self.urls = {"search": urljoin(self.url, "%s/")}
+        self.url = "https://katcrs.bid"
+        self.urls = {"search": urljoin(self.url, "/search/")}
 
         self.custom_url = None
 
@@ -51,13 +51,7 @@ class KatProvider(TorrentProvider):  # pylint: disable=too-many-instance-attribu
     def search(self, search_strings, age=0, ep_obj=None):  # pylint: disable=too-many-branches, too-many-locals, too-many-statements
         results = []
 
-        anime = (self.show and self.show.anime) or (ep_obj and ep_obj.show and ep_obj.show.anime) or False
         search_params = {
-            "q": "",
-            "field": "seeders",
-            "sorder": "desc",
-            "rss": 1,
-            "category": ("tv", "anime")[anime]
         }
 
         for mode in search_strings:
@@ -65,14 +59,11 @@ class KatProvider(TorrentProvider):  # pylint: disable=too-many-instance-attribu
             logger.log("Search Mode: {0}".format(mode), logger.DEBUG)
             for search_string in search_strings[mode]:
 
-                search_params["q"] = search_string if mode != "RSS" else ""
-                search_params["field"] = "seeders" if mode != "RSS" else "time_add"
-
                 if mode != "RSS":
                     logger.log("Search string: {0}".format
                                (search_string.decode("utf-8")), logger.DEBUG)
 
-                search_url = self.urls["search"] % ("usearch" if mode != "RSS" else search_string)
+                search_url = urljoin(self.urls["search"], search_string) + "/"
                 if self.custom_url:
                     if not validators.url(self.custom_url):
                         logger.log("Invalid custom url: {0}".format(self.custom_url), logger.WARNING)
@@ -84,57 +75,54 @@ class KatProvider(TorrentProvider):  # pylint: disable=too-many-instance-attribu
                     logger.log("URL did not return results/data, if the results are on the site maybe try a custom url, or a different one", logger.DEBUG)
                     continue
 
-                if not data.startswith("<?xml"):
-                    logger.log("Expected xml but got something else, is your mirror failing?", logger.INFO)
-                    continue
+                with BS4Parser(data, 'html5lib') as html:
+                    torrent_table = html.find(class_='data')
+                    torrent_rows = torrent_table('tr') if torrent_table else []
 
-                with BS4Parser(data, "html5lib") as html:
-                    for item in html("item"):
+                    # Continue only if at least one Release is found
+                    if len(torrent_rows) < 2:
+                        logger.log('Data returned from provider does not contain any torrents', logger.DEBUG)
+                        continue
+
+                    # torrent name, size, age, seed, leech
+                    labels = [label.get_text(strip=True) for label in torrent_rows[0]('th')]
+
+                    # iterate rows
+                    for result in torrent_rows[0:]:
+                        cells = result('td')
+                        if len(cells) < len(labels):
+                            continue
+
                         try:
-                            title = item.title.get_text(strip=True)
-                            # Use the torcache link kat provides,
-                            # unless it is not torcache or we are not using blackhole
-                            # because we want to use magnets if connecting direct to client
-                            # so that proxies work.
-                            download_url = item.enclosure["url"]
-                            if sickbeard.TORRENT_METHOD != "blackhole" or "torcache" not in download_url:
-                                download_url = item.find("torrent:magneturi").next.replace("CDATA", "").strip("[!]") + self._custom_trackers
-
-                            if not (title and download_url):
+                            title = cells[labels.index('torrent name')].get_text(strip=True)
+                            download_url = urljoin(self.url, cells[labels.index('torrent name')].find('a', title='Download torrent file')['href'])
+                            if not all([title, download_url]):
                                 continue
 
-                            seeders = try_int(item.find("torrent:seeds").get_text(strip=True))
-                            leechers = try_int(item.find("torrent:peers").get_text(strip=True))
+                            seeders = try_int(cells[labels.index('seed')].get_text(strip=True))
+                            leechers = try_int(cells[labels.index('leech')].get_text(strip=True))
 
                             # Filter unseeded torrent
                             if seeders < self.minseed or leechers < self.minleech:
-                                if mode != "RSS":
-                                    logger.log("Discarding torrent because it doesn't meet the minimum seeders or leechers: {0} (S:{1} L:{2})".format
+                                if mode != 'RSS':
+                                    logger.log('Discarding torrent because it doesn\'t meet the minimum seeders or leechers: {0} (S:{1} L:{2})'.format
                                                (title, seeders, leechers), logger.DEBUG)
                                 continue
 
-                            verified = bool(try_int(item.find("torrent:verified").get_text(strip=True)))
-                            if self.confirmed and not verified:
-                                if mode != "RSS":
-                                    logger.log("Found result " + title + " but that doesn't seem like a verified result so I'm ignoring it", logger.DEBUG)
-                                continue
-
-                            torrent_size = item.find("torrent:contentlength").get_text(strip=True)
+                            torrent_size = cells[labels.index('size')].get_text(strip=True).replace('\xa0', ' ')
                             size = convert_size(torrent_size) or -1
-                            info_hash = item.find("torrent:infohash").get_text(strip=True)
 
-                            item = {'title': title, 'link': download_url, 'size': size, 'seeders': seeders, 'leechers': leechers, 'hash': info_hash}
-                            if mode != "RSS":
-                                logger.log("Found result: {0} with {1} seeders and {2} leechers".format(title, seeders, leechers), logger.DEBUG)
+                            item = {'title': title, 'link': download_url, 'size': size, 'seeders': seeders, 'leechers': leechers, 'hash': ''}
+                            if mode != 'RSS':
+                                logger.log('Found result: {0} with {1} seeders and {2} leechers'.format
+                                           (title, seeders, leechers), logger.DEBUG)
 
                             items.append(item)
-
-                        except (AttributeError, TypeError, KeyError, ValueError):
+                        except StandardError:
                             continue
 
             # For each search mode sort all the items by seeders if available
             items.sort(key=lambda d: try_int(d.get('seeders', 0)), reverse=True)
-
             results += items
 
         return results
